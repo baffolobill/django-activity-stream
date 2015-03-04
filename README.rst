@@ -1,3 +1,15 @@
+Distinctions
+============
+
+
+* overwritten for ``MongoEngine``
+* removed: templates, templatetags, views, urls, feeds and all related tests (because I need only business logic; all this stuff available via API)
+* migrations are no longer needed
+* removed admin.py: django admin does not support mongoengine
+* dropped JSONField support: MongoEngine support it out of the box
+* tests adapted for my own Custom User Model, so they might not passed for you
+
+
 Django Activity Stream
 ======================
 

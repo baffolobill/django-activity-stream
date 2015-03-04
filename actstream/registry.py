@@ -1,112 +1,103 @@
+from functools import wraps
 from inspect import isclass
 import re
 
-import django
 from django.conf import settings
-from django.db.models import get_model
-from django.db.models.base import ModelBase
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.six import string_types
 
 
-from actstream.compat import generic
-
+from mongoengine.base import get_document, TopLevelDocumentMetaclass
+from mongoengine.queryset import Q
+from mongoengine.signals import pre_delete
 
 class RegistrationError(Exception):
     pass
 
+def actor_actions(self):
+    Action = get_document('actstream.Action')
+    return Action.objects(actor=self)
 
-def setup_generic_relations(model_class):
+def target_actions(self):
+    Action = get_document('actstream.Action')
+    return Action.objects(target=self)
+
+def action_object_actions(self):
+    Action = get_document('actstream.Action')
+    return Action.objects(action_object=self)
+
+def clear_relations_on_delete(sender, document):
+    Action = get_document('actstream.Action')
+    Action.objects(Q(actor=document) | Q(target=document) | Q(action_object=document)).delete()
+
+def setup_generic_relations(document_class):
     """
     Set up GenericRelations for actionable models.
     """
-    Action = get_model('actstream', 'action')
 
-    if Action is None:
-        raise RegistrationError('Unable get actstream.Action. Potential circular imports '
-                                'in initialisation. Try moving actstream app to come after the '
-                                'apps which have models to register in the INSTALLED_APPS setting.')
+    document_class.actor_actions = property(actor_actions)
+    document_class.target_actions = property(target_actions)
+    document_class.action_object_actions = property(action_object_actions)
 
-    related_attr_name = 'related_name'
-    related_attr_value = 'actions_with_%s' % label(model_class)
-    if django.VERSION[:2] >= (1, 7):
-        related_attr_name = 'related_query_name'
+    pre_delete.connect(clear_relations_on_delete, sender=document_class)
+
     relations = {}
     for field in ('actor', 'target', 'action_object'):
         attr = '%s_actions' % field
-        attr_value = '%s_as_%s' % (related_attr_value, field)
-        kwargs = {
-            'content_type_field': '%s_content_type' % field,
-            'object_id_field': '%s_object_id' % field,
-            related_attr_name: attr_value
-        }
-        rel = generic.GenericRelation('actstream.Action', **kwargs)
-        rel = rel.contribute_to_class(model_class, attr)
-        relations[field] = rel
 
-        # @@@ I'm not entirely sure why this works
-        setattr(Action, attr_value, None)
+        relations[field] = getattr(document_class, attr)
+
     return relations
 
 
-def label(model_class):
-    if hasattr(model_class._meta, 'model_name'):
-        model_name = model_class._meta.model_name
-    else:
-        model_name = model_class._meta.module_name
-    return '%s_%s' % (model_class._meta.app_label, model_name)
-
-
-def is_installed(model_class):
+def is_installed(document_class):
     """
-    Returns True if a model_class is installed.
-    model_class._meta.installed is only reliable in Django 1.7+
+    Returns True if a document_class is installed.
     """
-    if django.VERSION[:2] >= (1, 7):
-        return model_class._meta.installed
-    return re.sub(r'\.models.*$', '', model_class.__module__) in settings.INSTALLED_APPS
+    return re.sub(r'\.models.*$', '', document_class.__module__) in settings.INSTALLED_APPS
 
 
-def validate(model_class, exception_class=ImproperlyConfigured):
-    if isinstance(model_class, string_types):
-        model_class = get_model(*model_class.split('.'))
-    if not isinstance(model_class, ModelBase):
+def validate(document_class, exception_class=ImproperlyConfigured):
+    if isinstance(document_class, string_types):
+        document_class = get_document(document_class)
+
+    if not isinstance(document_class, TopLevelDocumentMetaclass):
         raise exception_class(
-            'Object %r is not a Model class.' % model_class)
-    if model_class._meta.abstract:
+            'Object %r is not a Document class.' % document_class)
+    if document_class._meta.get('abstract', False):
         raise exception_class(
-            'The model %r is abstract, so it cannot be registered with '
-            'actstream.' % model_class)
-    if not is_installed(model_class):
+            'The document %r is abstract, so it cannot be registered with '
+            'actstream.' % document_class)
+    if not is_installed(document_class):
         raise exception_class(
-            'The model %r is not installed, please put the app "%s" in your '
-            'INSTALLED_APPS setting.' % (model_class,
-                                         model_class._meta.app_label))
-    return model_class
+            'The document %r is not installed, please put the app "%s" in your '
+            'INSTALLED_APPS setting.' % (document_class,
+                                         document_class.__module__.split('.', 1)[0]))
+    return document_class
 
 
 class ActionableModelRegistry(dict):
 
-    def register(self, *model_classes_or_labels):
-        for class_or_label in model_classes_or_labels:
-            model_class = validate(class_or_label)
-            if model_class not in self:
-                self[model_class] = setup_generic_relations(model_class)
+    def register(self, *document_classes):
+        for cls in document_classes:
+            document_class = validate(cls)
+            if document_class not in self:
+                self[document_class] = setup_generic_relations(document_class)
 
-    def unregister(self, *model_classes_or_labels):
-        for class_or_label in model_classes_or_labels:
-            model_class = validate(class_or_label)
-            if model_class in self:
-                del self[model_class]
+    def unregister(self, *document_classes):
+        for cls in document_classes:
+            document_class = validate(cls)
+            if document_class in self:
+                del self[document_class]
 
-    def check(self, model_class_or_object):
-        if not isclass(model_class_or_object):
-            model_class_or_object = model_class_or_object.__class__
-        model_class = validate(model_class_or_object, RuntimeError)
-        if model_class not in self:
+    def check(self, document_class_or_object):
+        if not isclass(document_class_or_object):
+            document_class_or_object = document_class_or_object.__class__
+        document_class = validate(document_class_or_object, RuntimeError)
+        if document_class not in self:
             raise ImproperlyConfigured(
                 'The model %s is not registered. Please use actstream.registry '
-                'to register it.' % model_class.__name__)
+                'to register it.' % document_class.__name__)
 
 registry = ActionableModelRegistry()
 register = registry.register

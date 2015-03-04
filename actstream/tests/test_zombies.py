@@ -6,11 +6,17 @@ from django.utils.six import text_type
 
 from actstream.compat import get_user_model
 from actstream.signals import action
-from actstream.models import model_stream
+from actstream.models import document_stream
 from .base import ActivityBaseTestCase
 
 
 class ZombieTest(ActivityBaseTestCase):
+    """
+    Does not work properly. I didn't find any built-in
+    to calculate queries number. Current solution returns
+    zero new queries for queryset. It seems pymongo and/or
+    mongoengine are cached them somehow and do not extra queries.
+    """
     human = 10
     zombie = 1
 
@@ -20,7 +26,7 @@ class ZombieTest(ActivityBaseTestCase):
         settings.DEBUG = True
 
         player_generator = lambda n, count: [self.User.objects.create(
-            username='%s%d' % (n, i)) for i in range(count)]
+            email='%s%d@exa.com' % (n, i), page_url='%s%d' % (n, i)) for i in range(count)]
 
         self.humans = player_generator('human', self.human)
         self.zombies = player_generator('zombie', self.zombie)
@@ -44,22 +50,29 @@ class ZombieTest(ActivityBaseTestCase):
                     break
 
     def check_query_count(self, queryset):
-        ci = len(connection.queries)
+        for dumper in self.dumpers:
+            dumper.install()
 
+        ci = len(connection.queries)
         result = list([map(text_type, (x.actor, x.target, x.action_object))
                        for x in queryset])
+
         self.assertTrue(len(connection.queries) - ci <= 4,
                         'Too many queries, got %d expected no more than 4' %
                         len(connection.queries))
+
+        for dumper in self.dumpers:
+            dumper.uninstall()
+
         return result
 
     def test_query_count(self):
-        queryset = model_stream(self.User)
+        queryset = document_stream(self.User)
         result = self.check_query_count(queryset)
         self.assertEqual(len(result), 10)
 
     def test_query_count_sliced(self):
-        queryset = model_stream(self.User)[:5]
+        queryset = document_stream(self.User)[:5]
         result = self.check_query_count(queryset)
         self.assertEqual(len(result), 5)
 

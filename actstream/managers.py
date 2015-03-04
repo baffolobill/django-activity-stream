@@ -1,15 +1,11 @@
-from collections import defaultdict
+from mongoengine.base import get_document
+from mongoengine.queryset import QuerySet, Q
 
-from django.db.models import get_model
-from django.db.models import Q
-from django.contrib.contenttypes.models import ContentType
-
-from actstream.gfk import GFKManager
 from actstream.decorators import stream
 from actstream.registry import check
 
 
-class ActionManager(GFKManager):
+class ActionQuerySet(QuerySet):
     """
     Default manager for Actions, accessed through Action.objects
     """
@@ -49,16 +45,20 @@ class ActionManager(GFKManager):
         return obj.action_object_actions.public(**kwargs)
 
     @stream
-    def model_actions(self, model, **kwargs):
+    def document_actions(self, document, **kwargs):
         """
-        Stream of most recent actions by any particular model
+        Stream of most recent actions by any particular document
         """
-        check(model)
-        ctype = ContentType.objects.get_for_model(model)
+        check(document)
+        if hasattr(document, '__name__'):
+            doc_cls_name = document.__name__
+        else:
+            doc_cls_name = document.__class__.__name__
+
         return self.public(
-            (Q(target_content_type=ctype) |
-             Q(action_object_content_type=ctype) |
-             Q(actor_content_type=ctype)),
+            (Q(__raw__={'target._cls': doc_cls_name}) |
+             Q(__raw__={'action_object._cls': doc_cls_name}) |
+             Q(__raw__={'actor._cls': doc_cls_name})),
             **kwargs
         )
 
@@ -68,17 +68,13 @@ class ActionManager(GFKManager):
         Stream of most recent actions where obj is the actor OR target OR action_object.
         """
         check(obj)
-        ctype = ContentType.objects.get_for_model(obj)
         return self.public(
             Q(
-                actor_content_type=ctype,
-                actor_object_id=obj.pk,
+                actor=obj
             ) | Q(
-                target_content_type=ctype,
-                target_object_id=obj.pk,
+                target=obj
             ) | Q(
-                action_object_content_type=ctype,
-                action_object_object_id=obj.pk,
+                action_object=obj
             ), **kwargs)
 
     @stream
@@ -94,44 +90,35 @@ class ActionManager(GFKManager):
             return qs.none()
 
         check(obj)
-        actors_by_content_type = defaultdict(lambda: [])
-        others_by_content_type = defaultdict(lambda: [])
+        actors = []
+        others = []
 
         if kwargs.pop('with_user_activity', False):
-            object_content_type = ContentType.objects.get_for_model(obj)
-            actors_by_content_type[object_content_type.id].append(obj.pk)
+            actors.append(obj)
 
-        follow_gfks = get_model('actstream', 'follow').objects.filter(
-            user=obj).values_list('content_type_id',
-                                  'object_id', 'actor_only')
+        follow_objects = get_document('actstream.Follow').objects.filter(
+            user=obj).values_list('follow_object', 'actor_only').no_cache()
 
-        for content_type_id, object_id, actor_only in follow_gfks.iterator():
-            actors_by_content_type[content_type_id].append(object_id)
+        for follow_object, actor_only in follow_objects():
+            actors.append(follow_object)
             if not actor_only:
-                others_by_content_type[content_type_id].append(object_id)
+                others.append(follow_object)
 
-        if len(actors_by_content_type) + len(others_by_content_type) == 0:
+        if len(actors) + len(others) == 0:
             return qs.none()
 
-        for content_type_id, object_ids in actors_by_content_type.items():
-            q = q | Q(
-                actor_content_type=content_type_id,
-                actor_object_id__in=object_ids,
-            )
-        for content_type_id, object_ids in others_by_content_type.items():
-            q = q | Q(
-                target_content_type=content_type_id,
-                target_object_id__in=object_ids,
-            ) | Q(
-                action_object_content_type=content_type_id,
-                action_object_object_id__in=object_ids,
-            )
+        if len(actors):
+            q = q | Q(actor__in=actors)
+
+        if len(others):
+            q = q | Q(target__in=others) | Q(action_object__in=others)
+
         return qs.filter(q, **kwargs)
 
 
-class FollowManager(GFKManager):
+class FollowQuerySet(QuerySet):
     """
-    Manager for Follow model.
+    Manager for Follow document.
     """
 
     def for_object(self, instance):
@@ -139,8 +126,7 @@ class FollowManager(GFKManager):
         Filter to a specific instance.
         """
         check(instance)
-        content_type = ContentType.objects.get_for_model(instance).pk
-        return self.filter(content_type=content_type, object_id=instance.pk)
+        return self.filter(follow_object=instance)
 
     def is_following(self, user, instance):
         """
@@ -149,17 +135,14 @@ class FollowManager(GFKManager):
         if not user or user.is_anonymous():
             return False
         queryset = self.for_object(instance)
-        return queryset.filter(user=user).exists()
+        return bool(queryset.filter(user=user).count())
 
     def followers_qs(self, actor):
         """
         Returns a queryset of User objects who are following the given actor (eg my followers).
         """
         check(actor)
-        return self.filter(
-            content_type=ContentType.objects.get_for_model(actor),
-            object_id=actor.pk
-        ).select_related('user')
+        return self.for_object(actor).select_related()
 
     def followers(self, actor):
         """
@@ -167,24 +150,26 @@ class FollowManager(GFKManager):
         """
         return [follow.user for follow in self.followers_qs(actor)]
 
-    def following_qs(self, user, *models):
+    def following_qs(self, user, *documents):
         """
         Returns a queryset of actors that the given user is following (eg who im following).
-        Items in the list can be of any model unless a list of restricted models are passed.
+        Items in the list can be of any document unless a list of restricted models are passed.
         Eg following(user, User) will only return users following the given user
+
+        TEST REQUIRED for __raw__ query
         """
         qs = self.filter(user=user)
         ctype_filters = Q()
-        for model in models:
-            check(model)
-            ctype_filters |= Q(content_type=ContentType.objects.get_for_model(model))
+        for document in documents:
+            check(document)
+            ctype_filters |= Q(__raw__={'follow_object._cls': document.__name__})
         qs = qs.filter(ctype_filters)
-        return qs.fetch_generic_relations('follow_object')
+        return qs.select_related()
 
-    def following(self, user, *models):
+    def following(self, user, *documents):
         """
         Returns a list of actors that the given user is following (eg who im following).
-        Items in the list can be of any model unless a list of restricted models are passed.
+        Items in the list can be of any document unless a list of restricted models are passed.
         Eg following(user, User) will only return users following the given user
         """
-        return [follow.follow_object for follow in self.following_qs(user, *models)]
+        return [follow.follow_object for follow in self.following_qs(user, *documents)]

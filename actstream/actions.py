@@ -1,11 +1,10 @@
 import datetime
 
-from django.db.models import get_model
 from django.utils.translation import ugettext_lazy as _
 from django.utils.six import text_type
-from django.contrib.contenttypes.models import ContentType
 
-from actstream import settings
+from mongoengine.base import get_document
+
 from actstream.signals import action
 from actstream.registry import check
 
@@ -37,11 +36,12 @@ def follow(user, obj, send_action=True, actor_only=True, **kwargs):
         follow(request.user, group, actor_only=False)
     """
     check(obj)
-    instance, created = get_model('actstream', 'follow').objects.get_or_create(
-        user=user, object_id=obj.pk,
-        content_type=ContentType.objects.get_for_model(obj),
-        actor_only=actor_only)
-    if send_action and created:
+
+    instance = get_document('actstream.Follow').objects(
+        user=user, follow_object=obj, actor_only=actor_only).modify(
+        new=True, upsert=True, set__user=user, set__follow_object=obj,
+        set__actor_only=actor_only)
+    if send_action:
         action.send(user, verb=_('started following'), target=obj, **kwargs)
     return instance
 
@@ -58,9 +58,8 @@ def unfollow(user, obj, send_action=False):
         unfollow(request.user, other_user)
     """
     check(obj)
-    get_model('actstream', 'follow').objects.filter(
-        user=user, object_id=obj.pk,
-        content_type=ContentType.objects.get_for_model(obj)
+    get_document('actstream.Follow').objects.filter(
+        user=user, follow_object=obj
     ).delete()
     if send_action:
         action.send(user, verb=_('stopped following'), target=obj)
@@ -77,9 +76,8 @@ def is_following(user, obj):
         is_following(request.user, group)
     """
     check(obj)
-    return get_model('actstream', 'follow').objects.filter(
-        user=user, object_id=obj.pk,
-        content_type=ContentType.objects.get_for_model(obj)
+    return get_document('actstream.Follow').objects.filter(
+        user=user, follow_object=obj
     ).exists()
 
 
@@ -95,9 +93,8 @@ def action_handler(verb, **kwargs):
     if hasattr(verb, '_proxy____args'):
         verb = verb._proxy____args[0]
 
-    newaction = get_model('actstream', 'action')(
-        actor_content_type=ContentType.objects.get_for_model(actor),
-        actor_object_id=actor.pk,
+    newaction = get_document('actstream.Action')(
+        actor=actor,
         verb=text_type(verb),
         public=bool(kwargs.pop('public', True)),
         description=kwargs.pop('description', None),
@@ -108,10 +105,8 @@ def action_handler(verb, **kwargs):
         obj = kwargs.pop(opt, None)
         if obj is not None:
             check(obj)
-            setattr(newaction, '%s_object_id' % opt, obj.pk)
-            setattr(newaction, '%s_content_type' % opt,
-                    ContentType.objects.get_for_model(obj))
-    if settings.USE_JSONFIELD and len(kwargs):
+            setattr(newaction, opt, obj)
+    if len(kwargs):
         newaction.data = kwargs
     newaction.save(force_insert=True)
     return newaction

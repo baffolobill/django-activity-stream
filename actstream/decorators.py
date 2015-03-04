@@ -26,5 +26,5 @@ def stream(func):
             qs = manager.public(*qs)
         if offset or limit:
             qs = qs[offset:limit]
-        return qs.fetch_generic_relations()
+        return qs.select_related()
     return wrapped
